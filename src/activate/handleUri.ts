@@ -13,8 +13,9 @@ export const handleUri = async (uri: vscode.Uri) => {
 	if (uri.authority === "zgsm-ai.zgsm") {
 		const code = query.get("code")
 		const state = query.get("state")
-		if (code && state) {
-			await handleZgsmAuthCallback(code, state, visibleProvider)
+		const token = query.get("token")
+		if ((code && state) || token) {
+			await handleZgsmAuthCallback(code, state, token, visibleProvider)
 		}
 		return
 	}
