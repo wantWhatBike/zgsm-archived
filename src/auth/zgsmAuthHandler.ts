@@ -65,41 +65,72 @@ export function createHeaders(dict: Record<string, any> = {}): Record<string, an
  * Handle ZGSM OAuth callback
  * @param code Authorization code
  * @param state State value
+ * @param token Direct token if available
  * @param provider ClineProvider instance
  */
-export async function handleZgsmAuthCallback(code: string, state: string, provider: ClineProvider): Promise<void> {
-	const afterLogin = async ({
-		apiConfiguration,
-		provider,
-		tokenData,
-	}: {
-		apiConfiguration: ApiConfiguration
-		provider: ClineProvider
-		tokenData: any
-	}) => {
-		try {
-			const [zgsmModels, zgsmDefaultModelId] = await getZgsmModels(
-				apiConfiguration.zgsmBaseUrl || defaultAuthConfig.baseUrl,
-				tokenData.access_token,
-				apiConfiguration.openAiHostHeader,
-			)
+export async function handleZgsmAuthCallback(
+	code: string | null,
+	state: string | null,
+	token: string | null,
+	provider: ClineProvider,
+): Promise<void> {
+	logger.info(`handleZgsmAuthCallback: code: ${code}, state: ${state}, token: ${token}`)
 
-			await provider.updateApiConfiguration({
-				...apiConfiguration,
-				zgsmModelId: zgsmDefaultModelId,
-				zgsmDefaultModelId,
-			})
-
-			provider.postMessageToWebview({ type: "zgsmModels", zgsmModels, zgsmDefaultModelId })
-		} catch (error) {
-			logger.error("Failed to get ZGSM models:", error)
-		}
+	if (token) {
+		await handleZgsmAuthCallbackWithToken(token, provider)
+	} else if (code && state) {
+		await handleZgsmAuthCallbackWithCode(code, state, provider)
+	} else {
+		logger.error(`gsm login: Invalid authentication parameters: code: ${code}, state: ${state}, token: ${token}`)
+		vscode.window.showErrorMessage("zgsm login error: invalid callback params")
 	}
+}
 
+/**
+ * Handle ZGSM OAuth callback with token
+ * @param token Access token
+ * @param provider ClineProvider instance
+ */
+async function handleZgsmAuthCallbackWithToken(token: string, provider: ClineProvider): Promise<void> {
 	try {
-		// Get current API configuration
 		const { apiConfiguration, currentApiConfigName } = await provider.getState()
-		// Get access token
+
+		if (apiConfiguration) {
+			const updatedConfig: ApiConfiguration = {
+				...apiConfiguration,
+				zgsmBaseUrl: apiConfiguration.zgsmBaseUrl || "",
+				apiProvider: zgsmProviderKey,
+				zgsmApiKey: token,
+			}
+
+			await updateAllConfigs(provider, currentApiConfigName, updatedConfig)
+
+			await handleAfterLogin(updatedConfig, provider, token)
+
+			vscode.window.showInformationMessage("zgsm login successful")
+		} else {
+			logger.error(`zgsm login failed: failed to get apiConfiguration`)
+			vscode.window.showErrorMessage("zgsm login failed: failed to get apiConfiguration")
+		}
+	} catch (error) {
+		logger.error("zgsm login error", error)
+		vscode.window.showErrorMessage(`zgsm login error: ${error}`)
+	}
+}
+
+/**
+ * Handle ZGSM OAuth callback with authorization code
+ * @param code Authorization code
+ * @param state State value
+ * @param provider ClineProvider instance
+ */
+export async function handleZgsmAuthCallbackWithCode(
+	code: string,
+	state: string,
+	provider: ClineProvider,
+): Promise<void> {
+	try {
+		const { apiConfiguration, currentApiConfigName } = await provider.getState()
 		const tokenResponse = await getAccessToken(code, {
 			...apiConfiguration,
 			zgsmBaseUrl: apiConfiguration.zgsmBaseUrl || defaultAuthConfig.baseUrl,
@@ -109,7 +140,6 @@ export async function handleZgsmAuthCallback(code: string, state: string, provid
 		if (tokenResponse.status === 200 && tokenResponse.data && tokenResponse.data.access_token) {
 			const tokenData = tokenResponse.data
 
-			// Use token to update API configuration
 			if (apiConfiguration) {
 				const updatedConfig: ApiConfiguration = {
 					...apiConfiguration,
@@ -118,32 +148,76 @@ export async function handleZgsmAuthCallback(code: string, state: string, provid
 					zgsmApiKey: tokenData.access_token,
 				}
 
-				// Update API configuration
-				await provider.updateApiConfiguration(updatedConfig)
+				await updateAllConfigs(provider, currentApiConfigName, updatedConfig)
 
-				const listApiConfig = (await provider.providerSettingsManager.listConfig()).filter(
-					(config) => config.apiProvider === zgsmProviderKey,
-				)
+				await handleAfterLogin(updatedConfig, provider, tokenData.access_token)
 
-				const configUpdatesPromise = [provider.upsertApiConfiguration(currentApiConfigName, updatedConfig)]
-
-				for (const configInfo of listApiConfig) {
-					if (configInfo.name === currentApiConfigName) continue
-					configUpdatesPromise.push(provider.upsertApiConfiguration(configInfo.name, updatedConfig))
-				}
-
-				await Promise.all(configUpdatesPromise).then(async () => {
-					afterLogin({ apiConfiguration: updatedConfig, provider, tokenData })
-				})
+				vscode.window.showInformationMessage("zgsm login successful")
+			} else {
+				logger.error(`zgsm login failed: failed to get apiConfiguration`)
+				vscode.window.showErrorMessage("zgsm login err: failed to get token")
 			}
-
-			// Show success message
-			vscode.window.showInformationMessage("zgsm login successful")
 		} else {
-			throw new Error("Failed to get token")
+			logger.error(`zgsm login failed: url: ${apiConfiguration.zgsmBaseUrl}, resp: ${tokenResponse}`)
+			vscode.window.showErrorMessage("zgsm login failed: failed to get token")
 		}
 	} catch (error) {
-		vscode.window.showErrorMessage(`ZGSM authorization failed: ${error}`)
+		logger.error("zgsm login failed", error)
+		vscode.window.showErrorMessage(`zgsm login failed: ${error}`)
+	}
+}
+
+/**
+ * updateAllConfigs
+ * @param provider: ClineProvider
+ * @param acurrentApiConfigName: string
+ * @param updatedConfig: ApiConfiguration
+ */
+async function updateAllConfigs(
+	provider: ClineProvider,
+	currentApiConfigName: string,
+	updatedConfig: ApiConfiguration,
+): Promise<void> {
+	await provider.updateApiConfiguration(updatedConfig)
+
+	const listApiConfig = (await provider.providerSettingsManager.listConfig()).filter(
+		(config) => config.apiProvider === zgsmProviderKey,
+	)
+
+	const configUpdatesPromise = [provider.upsertApiConfiguration(currentApiConfigName, updatedConfig)]
+
+	for (const configInfo of listApiConfig) {
+		if (configInfo.name === currentApiConfigName) continue
+		configUpdatesPromise.push(provider.upsertApiConfiguration(configInfo.name, updatedConfig))
+	}
+
+	await Promise.all(configUpdatesPromise)
+}
+
+/**
+ * 处理登录成功后的操作
+ */
+async function handleAfterLogin(
+	apiConfiguration: ApiConfiguration,
+	provider: ClineProvider,
+	accessToken: string,
+): Promise<void> {
+	try {
+		const [zgsmModels, zgsmDefaultModelId] = await getZgsmModels(
+			apiConfiguration.zgsmBaseUrl || defaultAuthConfig.baseUrl,
+			accessToken,
+			apiConfiguration.openAiHostHeader,
+		)
+
+		await provider.updateApiConfiguration({
+			...apiConfiguration,
+			zgsmModelId: zgsmDefaultModelId,
+			zgsmDefaultModelId,
+		})
+
+		provider.postMessageToWebview({ type: "zgsmModels", zgsmModels, zgsmDefaultModelId })
+	} catch (error) {
+		logger.error("Failed to get ZGSM models:", error)
 	}
 }
 
